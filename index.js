@@ -37,7 +37,9 @@ chessIO.on("connection", (socket) => {
 
     socket.join(roomId);
 
-    cb({ ok: true, roomId, color: "white", fen: engine.fen() });
+    if (typeof cb === "function") {
+      cb({ ok: true, roomId, color: "white", fen: engine.fen() });
+    }
 
     chessIO.to(roomId).emit("roomUpdate", {
       id: roomId,
@@ -48,14 +50,17 @@ chessIO.on("connection", (socket) => {
 
   socket.on("joinRoom", ({ roomId, username }, cb) => {
     const room = chessRooms[roomId];
-    if (!room) return cb({ ok: false, error: "Room not found" });
-    if (room.players.length >= 2)
-      return cb({ ok: false, error: "Room full" });
+    if (!room || room.players.length >= 2) {
+      if (typeof cb === "function") cb({ ok: false });
+      return;
+    }
 
     room.players.push({ id: socket.id, username, color: "black" });
     socket.join(roomId);
 
-    cb({ ok: true, roomId, color: "black", fen: room.fen });
+    if (typeof cb === "function") {
+      cb({ ok: true, roomId, color: "black", fen: room.fen });
+    }
 
     chessIO.to(roomId).emit("roomUpdate", {
       id: roomId,
@@ -66,13 +71,19 @@ chessIO.on("connection", (socket) => {
 
   socket.on("makeMove", ({ roomId, from, to, promotion }, cb) => {
     const room = chessRooms[roomId];
-    if (!room) return cb({ ok: false });
+    if (!room) {
+      if (typeof cb === "function") cb({ ok: false });
+      return;
+    }
 
     const result = room.engine.move({ from, to, promotion });
-    if (!result) return cb({ ok: false });
+    if (!result) {
+      if (typeof cb === "function") cb({ ok: false });
+      return;
+    }
 
     room.fen = room.engine.fen();
-    cb({ ok: true });
+    if (typeof cb === "function") cb({ ok: true });
 
     chessIO.to(roomId).emit("movePlayed", {
       move: result,
@@ -100,40 +111,38 @@ liveIO.on("connection", (socket) => {
     socket.join(roomId);
     socket.data.roomId = roomId;
 
-    const pos = randomPos();
     liveRooms[roomId].users[socket.id] = {
       id: socket.id,
       name: username,
-      ...pos,
+      ...randomPos(),
       color: "#2c2c2c"
     };
 
-    cb({ ok: true, roomId, state: liveRooms[roomId] });
+    if (typeof cb === "function") {
+      cb({ ok: true, roomId, state: liveRooms[roomId] });
+    }
   });
 
   socket.on("joinRoom", ({ roomId, username }, cb) => {
     const room = liveRooms[roomId];
-    if (!room) return cb({ ok: false });
+    if (!room) {
+      if (typeof cb === "function") cb({ ok: false });
+      return;
+    }
 
     socket.join(roomId);
     socket.data.roomId = roomId;
 
-    const pos = randomPos();
     room.users[socket.id] = {
       id: socket.id,
       name: username,
-      ...pos,
+      ...randomPos(),
       color: "#2c2c2c"
     };
 
-    cb({ ok: true, roomId, state: room });
-  });
-
-  socket.on("disconnect", () => {
-    const room = liveRooms[socket.data.roomId];
-    if (!room) return;
-    delete room.users[socket.id];
-    if (!Object.keys(room.users).length) delete liveRooms[socket.data.roomId];
+    if (typeof cb === "function") {
+      cb({ ok: true, roomId, state: room });
+    }
   });
 });
 
@@ -145,13 +154,12 @@ const spyIO = io.of("/spy");
 const DISCUSSION_TIME = 2 * 60 * 1000;
 const VOTING_TIME = 1 * 60 * 1000;
 
-// LOAD WORDS FROM JSON
 const spyWordPairs = require("./data/spyWords.json");
 const spyRooms = {};
 
 function clearTimers(room) {
-  if (room.timers.discussion) clearTimeout(room.timers.discussion);
-  if (room.timers.voting) clearTimeout(room.timers.voting);
+  if (room.timers?.discussion) clearTimeout(room.timers.discussion);
+  if (room.timers?.voting) clearTimeout(room.timers.voting);
 }
 
 function emitState(room) {
@@ -171,7 +179,6 @@ function startDiscussion(room) {
   room.phase = "playing";
   room.phaseEndsAt = Date.now() + DISCUSSION_TIME;
   emitState(room);
-
   room.timers.discussion = setTimeout(() => startVoting(room), DISCUSSION_TIME);
 }
 
@@ -181,7 +188,6 @@ function startVoting(room) {
   room.votes = {};
   room.phaseEndsAt = Date.now() + VOTING_TIME;
   emitState(room);
-
   room.timers.voting = setTimeout(() => resolveVoting(room), VOTING_TIME);
 }
 
@@ -247,18 +253,23 @@ spyIO.on("connection", (socket) => {
 
     socket.join(roomId);
     socket.data.roomId = roomId;
-    cb({ ok: true, roomId });
+
+    if (typeof cb === "function") cb({ ok: true, roomId });
     emitState(spyRooms[roomId]);
   });
 
   socket.on("joinLobby", ({ roomId, username }, cb) => {
     const room = spyRooms[roomId];
-    if (!room || room.phase !== "lobby") return cb({ ok: false });
+    if (!room || room.phase !== "lobby") {
+      if (typeof cb === "function") cb({ ok: false });
+      return;
+    }
 
     room.players.push({ id: socket.id, username });
     socket.join(roomId);
     socket.data.roomId = roomId;
-    cb({ ok: true });
+
+    if (typeof cb === "function") cb({ ok: true });
     emitState(room);
   });
 
