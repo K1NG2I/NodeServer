@@ -263,6 +263,129 @@ liveIO.on("connection", (socket) => {
 });
 
 /* ============================================
+   🕵️ SPY GAME NAMESPACE — /spy
+============================================ */
+const spyIO = io.of("/spy");
+
+// spyRooms = {
+//   abc123: {
+//     id,
+//     players: [{ id, username }],
+//     started: false,
+//     pair: { real, spy }
+//   }
+// }
+const spyRooms = [];
+
+const spyWordPairs = [
+  { real: "Airport", spy: "Bus Station" },
+  { real: "Hospital", spy: "Clinic" },
+  { real: "School", spy: "Library" },
+  { real: "Beach", spy: "Desert" },
+  { real: "Restaurant", spy: "Kitchen" }
+];
+
+spyIO.on("connection", (socket) => {
+  console.log("Spy connected:", socket.id);
+
+  socket.data.roomId = null;
+
+  /* CREATE LOBBY */
+  socket.on("createLobby", ({ username }, cb) => {
+    if (!username) return cb?.({ ok: false, error: "Username required" });
+
+    const roomId = makeRoomId();
+    const pair =
+      spyWordPairs[Math.floor(Math.random() * spyWordPairs.length)];
+
+    spyRooms[roomId] = {
+      id: roomId,
+      players: [{ id: socket.id, username }],
+      started: false,
+      pair
+    };
+
+    socket.join(roomId);
+    socket.data.roomId = roomId;
+
+    cb?.({ ok: true, roomId });
+
+    spyIO.to(roomId).emit("lobbyUpdate", {
+      id: roomId,
+      players: spyRooms[roomId].players
+    });
+  });
+
+  /* JOIN LOBBY */
+  socket.on("joinLobby", ({ roomId, username }, cb) => {
+    const room = spyRooms[roomId];
+    if (!room) return cb?.({ ok: false, error: "Lobby not found" });
+    if (room.started)
+      return cb?.({ ok: false, error: "Game already started" });
+
+    room.players.push({ id: socket.id, username });
+    socket.join(roomId);
+    socket.data.roomId = roomId;
+
+    cb?.({ ok: true });
+
+    spyIO.to(roomId).emit("lobbyUpdate", {
+      id: roomId,
+      players: room.players
+    });
+  });
+
+  /* START GAME */
+  socket.on("startGame", () => {
+    const roomId = socket.data.roomId;
+    const room = spyRooms[roomId];
+    if (!room || room.started) return;
+
+    room.started = true;
+
+    // Build cards
+    const total = room.players.length;
+    const cards = [];
+
+    for (let i = 0; i < total - 1; i++) {
+      cards.push({ type: "real", word: room.pair.real });
+    }
+    cards.push({ type: "spy", word: room.pair.spy });
+
+    // Shuffle
+    for (let i = cards.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [cards[i], cards[j]] = [cards[j], cards[i]];
+    }
+
+    // Assign privately
+    room.players.forEach((p, i) => {
+      spyIO.to(p.id).emit("yourCard", cards[i]);
+    });
+  });
+
+  socket.on("disconnect", () => {
+    const roomId = socket.data.roomId;
+    const room = spyRooms[roomId];
+    if (!room) return;
+
+    room.players = room.players.filter(p => p.id !== socket.id);
+
+    if (room.players.length === 0) {
+      delete spyRooms[roomId];
+    } else {
+      spyIO.to(roomId).emit("lobbyUpdate", {
+        id: roomId,
+        players: room.players
+      });
+    }
+
+    console.log("Spy disconnected:", socket.id);
+  });
+});
+
+
+/* ============================================
    START SERVER
 ============================================ */
 server.listen(4000, () => {
