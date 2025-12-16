@@ -261,21 +261,13 @@ liveIO.on("connection", (socket) => {
     console.log("LiveDots disconnected:", socket.id);
   });
 });
-
 /* ============================================
    🕵️ SPY GAME NAMESPACE — /spy
 ============================================ */
 const spyIO = io.of("/spy");
 
-// spyRooms = {
-//   abc123: {
-//     id,
-//     players: [{ id, username }],
-//     started: false,
-//     pair: { real, spy }
-//   }
-// }
-const spyRooms = [];
+const DISCUSSION_TIME = 2 * 60 * 1000; // 2 min
+const VOTING_TIME = 1 * 60 * 1000;     // 1 min
 
 const spyWordPairs = [
   { real: "Airport", spy: "Bus Station" },
@@ -285,42 +277,159 @@ const spyWordPairs = [
   { real: "Restaurant", spy: "Kitchen" }
 ];
 
+// roomId -> room
+const spyRooms = {};
+
+function clearTimers(room) {
+  if (room.timers.discussion) clearTimeout(room.timers.discussion);
+  if (room.timers.voting) clearTimeout(room.timers.voting);
+  room.timers.discussion = null;
+  room.timers.voting = null;
+}
+
+function emitState(room) {
+  spyIO.to(room.id).emit("roomState", {
+    id: room.id,
+    hostId: room.hostId,
+    players: room.players,
+    spectators: room.spectators,
+    phase: room.phase,
+    round: room.round,
+    phaseEndsAt: room.phaseEndsAt || null
+  });
+}
+
+function startDiscussion(room) {
+  clearTimers(room);
+
+  room.phase = "playing";
+  room.phaseEndsAt = Date.now() + DISCUSSION_TIME;
+
+  emitState(room);
+
+  room.timers.discussion = setTimeout(() => {
+    startVoting(room);
+  }, DISCUSSION_TIME);
+}
+
+function startVoting(room) {
+  clearTimers(room);
+
+  room.phase = "voting";
+  room.votes = {};
+  room.phaseEndsAt = Date.now() + VOTING_TIME;
+
+  emitState(room);
+
+  room.timers.voting = setTimeout(() => {
+    resolveVoting(room);
+  }, VOTING_TIME);
+}
+
+function resolveVoting(room) {
+  clearTimers(room);
+
+  const tally = {};
+  Object.values(room.votes).forEach(id => {
+    tally[id] = (tally[id] || 0) + 1;
+  });
+
+  let kickedId = null;
+  let maxVotes = 0;
+
+  for (const id in tally) {
+    if (tally[id] > maxVotes) {
+      kickedId = id;
+      maxVotes = tally[id];
+    }
+  }
+
+  // No votes → spy survives
+  if (!kickedId) {
+    endGame(room, "spy");
+    return;
+  }
+
+  // Spy caught
+  if (kickedId === room.spyId) {
+    endGame(room, "players", kickedId);
+    return;
+  }
+
+  // Move kicked to spectators
+  const kickedPlayer = room.players.find(p => p.id === kickedId);
+  room.players = room.players.filter(p => p.id !== kickedId);
+  room.spectators.push(kickedPlayer);
+
+  spyIO.to(room.id).emit("playerKicked", {
+    username: kickedPlayer.username
+  });
+
+  // Spy wins if only 2 left
+  if (room.players.length === 2) {
+    endGame(room, "spy");
+    return;
+  }
+
+  // Next round
+  room.round += 1;
+  startDiscussion(room);
+}
+
+function endGame(room, winner, kickedId = null) {
+  clearTimers(room);
+
+  room.phase = "ended";
+  room.phaseEndsAt = Date.now();
+
+  spyIO.to(room.id).emit("gameResult", {
+    winner,
+    spy: room.players.concat(room.spectators)
+      .find(p => p.id === room.spyId)?.username,
+    kicked: kickedId
+      ? room.players.concat(room.spectators)
+          .find(p => p.id === kickedId)?.username
+      : null
+  });
+
+  emitState(room);
+}
+
 spyIO.on("connection", (socket) => {
   console.log("Spy connected:", socket.id);
-
   socket.data.roomId = null;
 
   /* CREATE LOBBY */
   socket.on("createLobby", ({ username }, cb) => {
-    if (!username) return cb?.({ ok: false, error: "Username required" });
-
     const roomId = makeRoomId();
-    const pair =
-      spyWordPairs[Math.floor(Math.random() * spyWordPairs.length)];
+    const pair = spyWordPairs[Math.floor(Math.random() * spyWordPairs.length)];
 
     spyRooms[roomId] = {
       id: roomId,
+      hostId: socket.id,
       players: [{ id: socket.id, username }],
-      started: false,
-      pair
+      spectators: [],
+      spyId: null,
+      pair,
+      round: 1,
+      phase: "lobby",
+      votes: {},
+      timers: { discussion: null, voting: null },
+      phaseEndsAt: null
     };
 
     socket.join(roomId);
     socket.data.roomId = roomId;
 
     cb?.({ ok: true, roomId });
-
-    spyIO.to(roomId).emit("lobbyUpdate", {
-      id: roomId,
-      players: spyRooms[roomId].players
-    });
+    emitState(spyRooms[roomId]);
   });
 
   /* JOIN LOBBY */
   socket.on("joinLobby", ({ roomId, username }, cb) => {
     const room = spyRooms[roomId];
-    if (!room) return cb?.({ ok: false, error: "Lobby not found" });
-    if (room.started)
+    if (!room) return cb?.({ ok: false, error: "Room not found" });
+    if (room.phase !== "lobby")
       return cb?.({ ok: false, error: "Game already started" });
 
     room.players.push({ id: socket.id, username });
@@ -328,66 +437,75 @@ spyIO.on("connection", (socket) => {
     socket.data.roomId = roomId;
 
     cb?.({ ok: true });
-
-    spyIO.to(roomId).emit("lobbyUpdate", {
-      id: roomId,
-      players: room.players
-    });
+    emitState(room);
   });
 
-  /* START GAME */
+  /* START GAME (HOST ONLY) */
   socket.on("startGame", () => {
-    const roomId = socket.data.roomId;
-    const room = spyRooms[roomId];
-    if (!room || room.started) return;
+    const room = spyRooms[socket.data.roomId];
+    if (!room) return;
+    if (socket.id !== room.hostId) return;
+    if (room.players.length < 3) return;
 
-    room.started = true;
+    const spyIndex = Math.floor(Math.random() * room.players.length);
+    room.spyId = room.players[spyIndex].id;
 
-    // Build cards
-    const total = room.players.length;
-    const cards = [];
+    room.players.forEach(p => {
+      const card =
+        p.id === room.spyId
+          ? { type: "spy", word: room.pair.spy }
+          : { type: "real", word: room.pair.real };
 
-    for (let i = 0; i < total - 1; i++) {
-      cards.push({ type: "real", word: room.pair.real });
-    }
-    cards.push({ type: "spy", word: room.pair.spy });
-
-    // Shuffle
-    for (let i = cards.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [cards[i], cards[j]] = [cards[j], cards[i]];
-    }
-
-    // Assign privately
-    room.players.forEach((p, i) => {
-      spyIO.to(p.id).emit("yourCard", cards[i]);
+      spyIO.to(p.id).emit("yourCard", card);
     });
+
+    startDiscussion(room);
+  });
+
+  /* CAST VOTE */
+  socket.on("castVote", ({ targetId }) => {
+    const room = spyRooms[socket.data.roomId];
+    if (!room || room.phase !== "voting") return;
+    if (!room.players.find(p => p.id === socket.id)) return;
+    if (room.votes[socket.id]) return;
+
+    room.votes[socket.id] = targetId;
+  });
+
+  /* RESET GAME (HOST ONLY) */
+  socket.on("resetGame", () => {
+    const room = spyRooms[socket.data.roomId];
+    if (!room) return;
+    if (socket.id !== room.hostId) return;
+
+    clearTimers(room);
+
+    room.players = room.players.concat(room.spectators);
+    room.spectators = [];
+    room.spyId = null;
+    room.round = 1;
+    room.phase = "lobby";
+    room.votes = {};
+    room.phaseEndsAt = null;
+    room.pair =
+      spyWordPairs[Math.floor(Math.random() * spyWordPairs.length)];
+
+    emitState(room);
   });
 
   socket.on("disconnect", () => {
-    const roomId = socket.data.roomId;
-    const room = spyRooms[roomId];
+    const room = spyRooms[socket.data.roomId];
     if (!room) return;
 
     room.players = room.players.filter(p => p.id !== socket.id);
+    room.spectators = room.spectators.filter(p => p.id !== socket.id);
 
-    if (room.players.length === 0) {
-      delete spyRooms[roomId];
-    } else {
-      spyIO.to(roomId).emit("lobbyUpdate", {
-        id: roomId,
-        players: room.players
-      });
+    if (room.players.length === 0 && room.spectators.length === 0) {
+      clearTimers(room);
+      delete spyRooms[room.id];
+      return;
     }
 
-    console.log("Spy disconnected:", socket.id);
+    emitState(room);
   });
-});
-
-
-/* ============================================
-   START SERVER
-============================================ */
-server.listen(4000, () => {
-  console.log("Server running on http://localhost:4000");
 });
